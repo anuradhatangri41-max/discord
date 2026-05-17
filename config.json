@@ -1,0 +1,13 @@
+{
+  "prefix": ".",
+  "vouch_channel_id": null,
+  "ticket_category_id": null,
+  "ticket_roles": [],
+  "embed_title": "Welcome to Our Server",
+  "embed_description": "Use the buttons below to interact with our community.",
+  "embed_color": 5814783,
+  "embed_footer": "Powered by our bot",
+  "perks_description": "List your server perks here. Edit this in config.json under perks_description.",
+  "vouch_count": 0,
+  "admin_roles": []
+}
