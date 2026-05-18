@@ -30,8 +30,10 @@ const {
   Colors,
 } = require("discord.js");
 
-const fs   = require("fs");
-const path = require("path");
+const fs        = require("fs");
+const path      = require("path");
+const https     = require("https");
+const WebSocket = require("ws");
 
 // ---------------------------------------------------------------------------
 // Config & persistence
@@ -57,6 +59,17 @@ const DEFAULT_CONFIG = {
   embed_footer: "Powered by our bot",
   perks_description: "No perks configured yet. Ask an admin to set them up.",
   vouch_count: 0,
+  follow_role_id: null,
+  follow_cooldown_hours: 24,
+  follow_log_channel_id: null,
+  rfollow_image: null,
+  ffollow_image: null,
+  xfollow_image: null,
+  invite_link: null,
+  invite_role_id: null,
+  invite_channel_id: null,
+  invite_text: "Join our server!",
+  automsg_roles: [],
 };
 
 function loadConfig() {
@@ -134,14 +147,133 @@ function modEmbed(title, color) {
 // Client
 // ---------------------------------------------------------------------------
 
+// Cooldown store: "userId-platform" -> timestamp
+const followCooldowns = new Map();
+
+// ---------------------------------------------------------------------------
+// Auto-message / JoinVC system stores
+// ---------------------------------------------------------------------------
+const pendingSetups  = new Map(); // userId  -> { type, step, data }
+const activeSessions = new Map(); // sessId  -> { interval|ws, userId, desc, type }
+const dailyUsage     = new Map(); // `${userId}-YYYY-MM-DD` -> count
+
+function makeSessionId(prefix) {
+  return `${prefix}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+}
+
+function getDailyUsage(userId) {
+  const today = new Date().toISOString().slice(0, 10);
+  return dailyUsage.get(`${userId}-${today}`) || 0;
+}
+
+function incrementDailyUsage(userId) {
+  const today = new Date().toISOString().slice(0, 10);
+  const key   = `${userId}-${today}`;
+  dailyUsage.set(key, (dailyUsage.get(key) || 0) + 1);
+}
+
+// Returns highest daily_limit for this member's automsg_roles, or null if no access
+function getUserAutoMsgLimit(member) {
+  const cfg = loadConfig();
+  if (!cfg.automsg_roles || cfg.automsg_roles.length === 0) return null;
+  let highest = null;
+  for (const entry of cfg.automsg_roles) {
+    if (member.roles.cache.has(String(entry.role_id))) {
+      if (highest === null || entry.daily_limit > highest) highest = entry.daily_limit;
+    }
+  }
+  return highest;
+}
+
+// Send a message as a user token via Discord REST API
+function sendAsUser(userToken, channelId, content) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ content });
+    const req  = https.request(
+      {
+        hostname: "discord.com",
+        port: 443,
+        path: `/api/v10/channels/${channelId}/messages`,
+        method: "POST",
+        headers: {
+          Authorization: userToken,
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+          "User-Agent": "Mozilla/5.0",
+        },
+      },
+      (res) => {
+        let raw = "";
+        res.on("data", (c) => (raw += c));
+        res.on("end", () => {
+          try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
+          catch { resolve({ status: res.statusCode, body: {} }); }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// Join a Discord voice channel using a user token (gateway WebSocket)
+function joinVCToken(userToken, guildId, channelId) {
+  return new Promise((resolve, reject) => {
+    const ws  = new WebSocket("wss://gateway.discord.gg/?v=10&encoding=json");
+    let hbTimer   = null;
+    let resolved  = false;
+
+    const done = (r) => { if (!resolved) { resolved = true; resolve(r); } };
+    const fail = (e) => { if (!resolved) { resolved = true; reject(e); }  };
+
+    const killTimer = setTimeout(() => { ws.close(); fail(new Error("Gateway timeout")); }, 15000);
+
+    ws.on("message", (raw) => {
+      const msg = JSON.parse(raw);
+      // Op 10 Hello — start heartbeat + identify
+      if (msg.op === 10) {
+        hbTimer = setInterval(() => ws.send(JSON.stringify({ op: 1, d: null })), msg.d.heartbeat_interval);
+        ws.send(JSON.stringify({
+          op: 2,
+          d: {
+            token: userToken,
+            properties: { os: "windows", browser: "Discord Client", device: "" },
+            presence: { status: "online", afk: false },
+          },
+        }));
+      }
+      // Ready — send voice state update (join VC)
+      if (msg.op === 0 && msg.t === "READY") {
+        ws.send(JSON.stringify({
+          op: 4,
+          d: { guild_id: guildId, channel_id: channelId, self_mute: false, self_deaf: false },
+        }));
+        clearTimeout(killTimer);
+        done({ ws, hbTimer });
+      }
+      // Invalid session — bad token
+      if (msg.op === 9) {
+        clearTimeout(killTimer);
+        ws.close();
+        fail(new Error("Invalid token — session rejected by Discord"));
+      }
+    });
+    ws.on("error", (e) => { clearTimeout(killTimer); if (hbTimer) clearInterval(hbTimer); fail(e); });
+    ws.on("close",  ()  => { if (hbTimer) clearInterval(hbTimer); });
+  });
+}
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildPresences,
+    GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.Channel],
+  partials: [Partials.Channel, Partials.GuildMember, Partials.User, Partials.Message],
 });
 
 // ---------------------------------------------------------------------------
@@ -153,6 +285,43 @@ const startTime = Date.now();
 client.once("ready", () => {
   console.log(`✅  Logged in as ${client.user.tag}  |  Prefix: ${PREFIX}`);
   client.user.setActivity(`${PREFIX}help`, { type: 3 }); // Watching
+});
+
+// Presence update — detect server invite in user status
+client.on("presenceUpdate", async (oldPresence, newPresence) => {
+  try {
+    const cfg = loadConfig();
+    if (!cfg.invite_link || !cfg.invite_role_id) return;
+    const guild  = newPresence?.guild;
+    const member = newPresence?.member;
+    if (!guild || !member || member.user?.bot) return;
+
+    const activities = newPresence.activities || [];
+    const hasInvite  = activities.some(
+      (a) => a.type === 4 && a.state && a.state.includes(cfg.invite_link)
+    );
+    const role = guild.roles.cache.get(String(cfg.invite_role_id));
+    if (!role) return;
+
+    if (hasInvite && !member.roles.cache.has(role.id)) {
+      await member.roles.add(role, "Server invite in status");
+      if (cfg.invite_channel_id) {
+        const ch = guild.channels.cache.get(String(cfg.invite_channel_id));
+        if (ch) {
+          const embed = new EmbedBuilder()
+            .setTitle("🔗  Status Reward Claimed!")
+            .setDescription(`<@${member.id}> added our server invite to their status and earned <@&${role.id}>!`)
+            .setColor(Colors.Green)
+            .setThumbnail(member.displayAvatarURL())
+            .setTimestamp()
+            .setFooter({ text: cfg.invite_text || "Thank you for promoting us!" });
+          ch.send({ embeds: [embed] });
+        }
+      }
+    } else if (!hasInvite && member.roles.cache.has(role.id)) {
+      await member.roles.remove(role, "Server invite removed from status");
+    }
+  } catch { /* ignore */ }
 });
 
 // Snipe: cache last deleted message per channel
@@ -411,7 +580,157 @@ client.on("interactionCreate", async (interaction) => {
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
-  if (!message.guild) return;
+
+  // ── DM multi-step setup conversations ─────────────────────────────────────
+  if (!message.guild) {
+    const setup = pendingSetups.get(message.author.id);
+    if (!setup) return;
+
+    const dmReply = (text) => message.author.send(text).catch(() => {});
+    const val     = message.content.trim();
+
+    // ─── AUTOMSG flow ───────────────────────────────────────────────────────
+    if (setup.type === "automsg") {
+      if (setup.step === 0) {
+        setup.data.token = val;
+        setup.step = 1;
+        return dmReply("📝 **Step 2/5** — Send the **Channel ID** where messages should be posted.");
+      }
+      if (setup.step === 1) {
+        if (!/^\d{15,20}$/.test(val)) return dmReply("❌ That doesn't look like a valid Channel ID (numbers only).");
+        setup.data.channelId = val;
+        setup.step = 2;
+        return dmReply("📝 **Step 3/5** — What **message content** should be sent each time?");
+      }
+      if (setup.step === 2) {
+        setup.data.content = val;
+        setup.step = 3;
+        return dmReply(
+          "📝 **Step 4/5** — Choose a **mode**:\n" +
+          "`1` — 10 messages spread over 10 minutes (then stops)\n" +
+          "`2` — 3 messages per minute, runs 24/7 until stopped"
+        );
+      }
+      if (setup.step === 3) {
+        if (val !== "1" && val !== "2") return dmReply("❌ Reply with `1` or `2`.");
+        setup.data.mode = val;
+        setup.step = 4;
+        if (val === "2") {
+          return dmReply("📝 **Step 5/5** — How long should this run? (e.g. `2h`, `1d`, or `forever` for 24/7 with no stop)");
+        }
+        return dmReply("📝 **Step 5/5** — How long should this run? (e.g. `30m`, `2h`, `1d`, or `forever`)");
+      }
+      if (setup.step === 4) {
+        const { token: uToken, channelId, content, mode } = setup.data;
+        let durationMs = null;
+        if (val.toLowerCase() !== "forever") {
+          const m = val.match(/^(\d+)(s|m|h|d)$/i);
+          if (!m) return dmReply("❌ Invalid duration format. Use e.g. `30m`, `2h`, `1d`, or `forever`.");
+          durationMs = parseDuration(m[1], m[2].toLowerCase());
+          if (!durationMs) return dmReply("❌ Duration must be positive.");
+        }
+
+        const sessionId  = makeSessionId("AM");
+        // Mode 1: 10 msgs over 10 min = 1 msg/min (60s). Mode 2: 3 msgs/min = 1 msg/20s
+        const intervalMs = mode === "1" ? 60_000 : 20_000;
+        let count        = 0;
+        const maxCount   = mode === "1" ? 10 : Infinity;
+
+        const sess = { userId: message.author.id, desc: `Mode ${mode} → #${channelId}`, type: "msg" };
+        sess.interval = setInterval(async () => {
+          if (count >= maxCount) {
+            clearInterval(sess.interval);
+            activeSessions.delete(sessionId);
+            await message.author.send(`✅ Session \`${sessionId}\` completed — sent **${count}** messages.`).catch(() => {});
+            return;
+          }
+          const res = await sendAsUser(uToken, channelId, content).catch(() => null);
+          if (res && res.status === 401) {
+            clearInterval(sess.interval);
+            activeSessions.delete(sessionId);
+            await message.author.send(`❌ Session \`${sessionId}\` stopped — **invalid token** (401).`).catch(() => {});
+            return;
+          }
+          if (res && (res.status === 200 || res.status === 201)) count++;
+        }, intervalMs);
+
+        activeSessions.set(sessionId, sess);
+
+        if (durationMs) {
+          setTimeout(() => {
+            if (activeSessions.has(sessionId)) {
+              clearInterval(sess.interval);
+              activeSessions.delete(sessionId);
+              message.author.send(`✅ Session \`${sessionId}\` auto-stopped (duration reached).`).catch(() => {});
+            }
+          }, durationMs);
+        }
+
+        pendingSetups.delete(message.author.id);
+        incrementDailyUsage(message.author.id);
+
+        // Send first message immediately
+        sendAsUser(uToken, channelId, content).catch(() => {});
+        count++;
+
+        await dmReply(
+          `🚀 **Auto-message session started!**\n` +
+          `▸ Session ID : \`${sessionId}\`\n` +
+          `▸ Mode       : ${mode === "1" ? "10 msgs / 10 min" : "3 msgs / min (24/7)"}\n` +
+          `▸ Channel    : \`${channelId}\`\n` +
+          `▸ Duration   : ${durationMs ? formatDuration(durationMs) : "Forever"}\n\n` +
+          `Use \`.stopmsg ${sessionId}\` in the server to stop it at any time.`
+        );
+        return;
+      }
+    }
+
+    // ─── JOINVC flow ────────────────────────────────────────────────────────
+    if (setup.type === "joinvc") {
+      if (setup.step === 0) {
+        setup.data.token = val;
+        setup.step = 1;
+        return dmReply("📝 **Step 2/3** — Send the **Server ID (Guild ID)** to join the VC in.");
+      }
+      if (setup.step === 1) {
+        if (!/^\d{15,20}$/.test(val)) return dmReply("❌ That doesn't look like a valid Server ID.");
+        setup.data.guildId = val;
+        setup.step = 2;
+        return dmReply("📝 **Step 3/3** — Send the **Voice Channel ID** to join.");
+      }
+      if (setup.step === 2) {
+        if (!/^\d{15,20}$/.test(val)) return dmReply("❌ That doesn't look like a valid Channel ID.");
+        setup.data.vcChannelId = val;
+        pendingSetups.delete(message.author.id);
+
+        await dmReply("⏳ Connecting to voice channel…");
+        try {
+          const { ws, hbTimer } = await joinVCToken(setup.data.token, setup.data.guildId, setup.data.vcChannelId);
+          const sessionId = makeSessionId("VC");
+          activeSessions.set(sessionId, {
+            ws, hbTimer,
+            userId: message.author.id,
+            desc: `VC → ${setup.data.vcChannelId}`,
+            type: "vc",
+          });
+          await dmReply(
+            `✅ **Joined voice channel!**\n` +
+            `▸ Session ID : \`${sessionId}\`\n` +
+            `▸ Guild      : \`${setup.data.guildId}\`\n` +
+            `▸ Channel    : \`${setup.data.vcChannelId}\`\n\n` +
+            `Use \`.stopmsg ${sessionId}\` in the server to disconnect.`
+          );
+        } catch (err) {
+          await dmReply(`❌ Failed to join voice channel: \`${err.message}\``);
+        }
+        return;
+      }
+    }
+
+    return;
+  }
+  // ── end DM handler ─────────────────────────────────────────────────────────
+
   if (!message.content.startsWith(PREFIX)) return;
 
   const args    = message.content.slice(PREFIX.length).trim().split(/\s+/);
@@ -997,8 +1316,21 @@ client.on("messageCreate", async (message) => {
           { name: `\`${p}setup embed_title <text>\``,   value: "Set main embed title",               inline: false },
           { name: `\`${p}setup embed_desc <text>\``,    value: "Set main embed description",         inline: false },
           { name: `\`${p}setup embed_footer <text>\``,  value: "Set main embed footer",              inline: false },
-          { name: `\`${p}setup embed_color <hex>\``,    value: "Set main embed color (e.g. FF0000)", inline: false },
-          { name: `\`${p}setup perks <text>\``,         value: "Set perks description",              inline: false }
+          { name: `\`${p}setup embed_color <hex>\``,       value: "Set main embed color (e.g. FF0000)",       inline: false },
+          { name: `\`${p}setup perks <text>\``,          value: "Set perks description",                    inline: false },
+          { name: `\`${p}setup follow_role @role\``,     value: "Role allowed to use follow commands",       inline: false },
+          { name: `\`${p}setup follow_cooldown <hrs>\``, value: "Cooldown in hours between follow orders",   inline: false },
+          { name: `\`${p}setup follow_log #ch\``,        value: "Channel to log all follow orders",          inline: false },
+          { name: `\`${p}setup invite_link <url>\``,     value: "Server invite link for status reward",      inline: false },
+          { name: `\`${p}setup invite_role @role\``,     value: "Role given when invite is in status",       inline: false },
+          { name: `\`${p}setup invite_channel #ch\``,    value: "Channel to announce status reward claims",  inline: false },
+          { name: `\`${p}setup invite_text <text>\``,       value: "Text shown in .serverinvite embed",          inline: false },
+          { name: `\`${p}setup rfollow_image <url>\``,      value: "Big right-side image on Roblox follow embeds",    inline: false },
+          { name: `\`${p}setup ffollow_image <url>\``,      value: "Big right-side image on Facebook follow embeds",  inline: false },
+          { name: `\`${p}setup xfollow_image <url>\``,      value: "Big right-side image on Xbox follow embeds",      inline: false },
+          { name: `\`${p}setup automsg_role @role <n>\``,   value: "Grant role access to automsg/joinvc, n=daily limit", inline: false },
+          { name: `\`${p}setup rm_automsg_role @role\``,    value: "Revoke automsg/joinvc access from a role",        inline: false },
+          { name: `\`${p}setup automsg_roles\``,            value: "List all roles with automsg access",               inline: false }
         );
       return message.reply({ embeds: [embed] });
     }
@@ -1079,7 +1411,253 @@ client.on("messageCreate", async (message) => {
       return message.reply({ embeds: [okEmbed("Perks description updated.")] });
     }
 
+    // Follow system setup
+    if (sub === "follow_role") {
+      const role = message.mentions.roles.first();
+      if (!role) return message.reply({ embeds: [errEmbed("Mention a role.")] });
+      cfg.follow_role_id = role.id; saveConfig(cfg);
+      return message.reply({ embeds: [okEmbed(`<@&${role.id}> can now use follow commands.`)] });
+    }
+
+    if (sub === "follow_cooldown") {
+      const hrs = parseInt(args[1]);
+      if (isNaN(hrs) || hrs < 1) return message.reply({ embeds: [errEmbed("Provide hours (e.g. `.setup follow_cooldown 24`).")] });
+      cfg.follow_cooldown_hours = hrs; saveConfig(cfg);
+      return message.reply({ embeds: [okEmbed(`Follow cooldown set to **${hrs}h**.`)] });
+    }
+
+    if (sub === "follow_log") {
+      const ch = message.mentions.channels.first();
+      if (!ch) return message.reply({ embeds: [errEmbed("Mention a channel.")] });
+      cfg.follow_log_channel_id = ch.id; saveConfig(cfg);
+      return message.reply({ embeds: [okEmbed(`Follow orders will be logged in <#${ch.id}>.`)] });
+    }
+
+    // Invite / status reward setup
+    if (sub === "invite_link") {
+      const link = args[1];
+      if (!link) return message.reply({ embeds: [errEmbed("Provide the invite link.")] });
+      cfg.invite_link = link; saveConfig(cfg);
+      return message.reply({ embeds: [okEmbed(`Server invite link set to: **${link}**`)] });
+    }
+
+    if (sub === "invite_role") {
+      const role = message.mentions.roles.first();
+      if (!role) return message.reply({ embeds: [errEmbed("Mention a role.")] });
+      cfg.invite_role_id = role.id; saveConfig(cfg);
+      return message.reply({ embeds: [okEmbed(`<@&${role.id}> will be given when a user adds the invite to their status.`)] });
+    }
+
+    if (sub === "invite_channel") {
+      const ch = message.mentions.channels.first();
+      if (!ch) return message.reply({ embeds: [errEmbed("Mention a channel.")] });
+      cfg.invite_channel_id = ch.id; saveConfig(cfg);
+      return message.reply({ embeds: [okEmbed(`Status reward announcements will go to <#${ch.id}>.`)] });
+    }
+
+    if (sub === "invite_text") {
+      const text = args.slice(1).join(" ");
+      if (!text) return message.reply({ embeds: [errEmbed("Provide the text to show in the invite embed.")] });
+      cfg.invite_text = text; saveConfig(cfg);
+      return message.reply({ embeds: [okEmbed(`Invite text updated.`)] });
+    }
+
+    // Auto-message role access system
+    if (sub === "automsg_role") {
+      const role  = message.mentions.roles.first();
+      const limit = parseInt(args[2]);
+      if (!role)           return message.reply({ embeds: [errEmbed("Usage: `.setup automsg_role @role <daily_limit>`")] });
+      if (isNaN(limit) || limit < 1) return message.reply({ embeds: [errEmbed("Provide a daily session limit, e.g. `.setup automsg_role @role 3`")] });
+      const cfg2 = loadConfig();
+      cfg2.automsg_roles = cfg2.automsg_roles || [];
+      const existing = cfg2.automsg_roles.findIndex((r) => r.role_id === role.id);
+      if (existing >= 0) {
+        cfg2.automsg_roles[existing].daily_limit = limit;
+      } else {
+        cfg2.automsg_roles.push({ role_id: role.id, daily_limit: limit });
+      }
+      saveConfig(cfg2);
+      return message.reply({ embeds: [okEmbed(`<@&${role.id}> can now use \`.automsg\` & \`.joinvc\` — **${limit}** sessions/day.`)] });
+    }
+
+    if (sub === "rm_automsg_role") {
+      const role = message.mentions.roles.first();
+      if (!role) return message.reply({ embeds: [errEmbed("Mention the role to remove.")] });
+      const cfg2 = loadConfig();
+      cfg2.automsg_roles = (cfg2.automsg_roles || []).filter((r) => r.role_id !== role.id);
+      saveConfig(cfg2);
+      return message.reply({ embeds: [okEmbed(`<@&${role.id}> can no longer use auto-message commands.`)] });
+    }
+
+    if (sub === "automsg_roles") {
+      const cfg2 = loadConfig();
+      const list = (cfg2.automsg_roles || []);
+      if (list.length === 0) return message.reply({ embeds: [errEmbed("No automsg roles configured. Use `.setup automsg_role @role <daily_limit>`.")] });
+      const embed = new EmbedBuilder()
+        .setTitle("📋  AutoMsg Roles")
+        .setColor(Colors.Blurple)
+        .setDescription(list.map((r) => `<@&${r.role_id}> — **${r.daily_limit}** sessions/day`).join("\n"));
+      return message.reply({ embeds: [embed] });
+    }
+
+    // Follow embed image (thumbnail = right-hand side big image)
+    if (["rfollow_image", "ffollow_image", "xfollow_image"].includes(sub)) {
+      const url = args[1];
+      if (!url) return message.reply({ embeds: [errEmbed(`Provide an image URL.\nUsage: \`.setup ${sub} <image_url>\``)] });
+      const platformName = sub === "rfollow_image" ? "Roblox" : sub === "ffollow_image" ? "Facebook" : "Xbox";
+      cfg[sub] = url; saveConfig(cfg);
+      const previewEmbed = new EmbedBuilder()
+        .setDescription(`✅  **${platformName}** follow embed image updated!`)
+        .setColor(Colors.Green)
+        .setThumbnail(url)
+        .setFooter({ text: "This image will appear on the right side of all follow order embeds." });
+      return message.reply({ embeds: [previewEmbed] });
+    }
+
     message.reply({ embeds: [errEmbed(`Unknown subcommand. Run \`${p}setup\` for a list.`)] });
+    return;
+  }
+
+  // ==========================================================================
+  // FOLLOW COMMANDS (.rfollow / .ffollow / .xfollow)
+  // ==========================================================================
+
+  if (["rfollow", "ffollow", "xfollow"].includes(command)) {
+    const cfg = loadConfig();
+
+    // Role check
+    if (cfg.follow_role_id) {
+      const hasRole = member.roles.cache.has(String(cfg.follow_role_id));
+      if (!hasRole && !isAdmin(member)) {
+        return message.reply({
+          embeds: [errEmbed(`You need the <@&${cfg.follow_role_id}> role to use follow commands.`)],
+        });
+      }
+    }
+
+    // Cooldown check
+    const cooldownMs = (cfg.follow_cooldown_hours || 24) * 3600000;
+    const cooldownKey = `${member.id}-${command}`;
+    const lastUsed = followCooldowns.get(cooldownKey);
+    if (lastUsed && Date.now() - lastUsed < cooldownMs && !isAdmin(member)) {
+      const remaining = Math.ceil((cooldownMs - (Date.now() - lastUsed)) / 60000);
+      const hrs = Math.floor(remaining / 60);
+      const mins = remaining % 60;
+      return message.reply({
+        embeds: [errEmbed(`You're on cooldown! Try again in **${hrs > 0 ? `${hrs}h ` : ""}${mins}m**.`)],
+      });
+    }
+
+    const username = args[0];
+    if (!username) {
+      const usage = command === "rfollow" ? ".rfollow <roblox_username>"
+                  : command === "ffollow" ? ".ffollow <facebook_username>"
+                  : ".xfollow <xbox_gamertag>";
+      return message.reply({ embeds: [errEmbed(`Provide your username.\nUsage: \`${usage}\``)] });
+    }
+
+    // Platform config — custom image overrides the default if set
+    const platforms = {
+      rfollow: { name: "Roblox",   emoji: "🎮", color: 0x00b2ff, prefix: "RF", imageKey: "rfollow_image", defaultIcon: "https://i.imgur.com/QV9x6vQ.png" },
+      ffollow: { name: "Facebook", emoji: "📘", color: 0x1877f2, prefix: "FB", imageKey: "ffollow_image", defaultIcon: "https://i.imgur.com/Auvhrlg.png" },
+      xfollow: { name: "Xbox",     emoji: "🎮", color: 0x107c10, prefix: "XB", imageKey: "xfollow_image", defaultIcon: "https://i.imgur.com/7S4aJUi.png" },
+    };
+    const p = platforms[command];
+    const thumbUrl = cfg[p.imageKey] || p.defaultIcon;
+
+    const orderId    = `#${p.prefix}-${Math.floor(100000 + Math.random() * 900000)}`;
+    const followers  = Math.floor(100 + Math.random() * 401); // 100–500
+    const estMins    = Math.floor(2 + Math.random() * 8);
+
+    function progressBar(pct) {
+      const filled = Math.round(pct / 10);
+      return "█".repeat(filled) + "░".repeat(10 - filled) + ` ${pct}%`;
+    }
+
+    const pendingEmbed = new EmbedBuilder()
+      .setTitle(`${p.emoji}  ${p.name} Follow Order`)
+      .setColor(p.color)
+      .setThumbnail(thumbUrl)
+      .addFields(
+        { name: "👤  Username",     value: `\`${username}\``,              inline: true  },
+        { name: "🆔  Order ID",     value: orderId,                        inline: true  },
+        { name: "📦  Followers",    value: `**${followers}** followers`,   inline: true  },
+        { name: "📊  Status",       value: "⏳  **Pending** — Processing order...", inline: false },
+        { name: "🔄  Progress",     value: progressBar(0),                 inline: false },
+        { name: "⏱️  Est. Time",    value: `~${estMins} minutes`,         inline: true  },
+        { name: "🕐  Ordered",      value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
+      )
+      .setFooter({ text: `${p.name} Follow Service  •  Order placed by ${member.user.tag}` })
+      .setTimestamp();
+
+    const msg = await message.reply({ embeds: [pendingEmbed] });
+
+    // Set cooldown
+    followCooldowns.set(cooldownKey, Date.now());
+
+    // Simulate progress — edit message 3 times then mark complete
+    const steps = [
+      { delay: 3000,  pct: 25,  status: "🔄  **Processing** — Searching profile..." },
+      { delay: 7000,  pct: 55,  status: "🔄  **Processing** — Sending followers..."  },
+      { delay: 12000, pct: 85,  status: "🔄  **Processing** — Finalising order..."   },
+      { delay: 17000, pct: 100, status: "✅  **Completed** — Followers delivered!"   },
+    ];
+
+    for (const step of steps) {
+      await new Promise((r) => setTimeout(r, step.delay));
+      const updatedEmbed = new EmbedBuilder()
+        .setTitle(`${p.emoji}  ${p.name} Follow Order`)
+        .setColor(step.pct === 100 ? Colors.Green : p.color)
+        .setThumbnail(thumbUrl)
+        .addFields(
+          { name: "👤  Username",     value: `\`${username}\``,                inline: true  },
+          { name: "🆔  Order ID",     value: orderId,                          inline: true  },
+          { name: "📦  Followers",    value: `**${followers}** followers`,     inline: true  },
+          { name: "📊  Status",       value: step.status,                      inline: false },
+          { name: "🔄  Progress",     value: progressBar(step.pct),            inline: false },
+          { name: "⏱️  Est. Time",    value: step.pct === 100 ? "Done!" : `~${estMins} minutes`, inline: true },
+          { name: "🕐  Ordered",      value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true }
+        )
+        .setFooter({ text: `${p.name} Follow Service  •  Order placed by ${member.user.tag}` })
+        .setTimestamp();
+      await msg.edit({ embeds: [updatedEmbed] }).catch(() => {});
+    }
+
+    // Log to follow log channel if set
+    if (cfg.follow_log_channel_id) {
+      const logCh = message.guild.channels.cache.get(String(cfg.follow_log_channel_id));
+      if (logCh) {
+        const logEmbed = new EmbedBuilder()
+          .setTitle("📋  Follow Order Log")
+          .setColor(Colors.Blurple)
+          .setTimestamp()
+          .addFields(
+            { name: "Platform",  value: p.name,      inline: true },
+            { name: "Order ID",  value: orderId,     inline: true },
+            { name: "Username",  value: username,    inline: true },
+            { name: "Followers", value: String(followers), inline: true },
+            { name: "Ordered by",value: `<@${member.id}>`, inline: true },
+            { name: "Status",    value: "✅ Completed", inline: true }
+          );
+        logCh.send({ embeds: [logEmbed] });
+      }
+    }
+    return;
+  }
+
+  // .serverinvite  — show the configured server invite
+  if (command === "serverinvite") {
+    const cfg = loadConfig();
+    if (!cfg.invite_link) {
+      return message.reply({ embeds: [errEmbed("No server invite configured. Admin: run `.setup invite_link <url>`")] });
+    }
+    const embed = new EmbedBuilder()
+      .setTitle("🔗  Join Our Server!")
+      .setDescription(`${cfg.invite_text || "Click the link below to join!"}\n\n**${cfg.invite_link}**`)
+      .setColor(0x5865f2)
+      .setTimestamp()
+      .setFooter({ text: "Add this link to your Discord status to earn a reward!" });
+    message.reply({ embeds: [embed] });
     return;
   }
 
@@ -1727,6 +2305,119 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  // ==========================================================================
+  // AUTO-MESSAGE COMMANDS
+  // ==========================================================================
+
+  // .automsg — starts a DM-based session setup (with role + daily limit check)
+  if (command === "automsg") {
+    const cfg   = loadConfig();
+    const limit = getUserAutoMsgLimit(member);
+
+    if (!isAdmin(member) && limit === null) {
+      return message.reply({ embeds: [errEmbed("You don't have a role that can use `.automsg`. Ask an admin to run `.setup automsg_role @role <daily_limit>`.")] });
+    }
+
+    if (!isAdmin(member) && limit !== null) {
+      const used = getDailyUsage(member.id);
+      if (used >= limit) {
+        return message.reply({ embeds: [errEmbed(`You've reached your daily auto-message limit (**${limit}** sessions). Try again tomorrow.`)] });
+      }
+    }
+
+    if (pendingSetups.has(member.id)) {
+      return message.reply({ embeds: [errEmbed("You already have a setup in progress. Check your DMs or wait a few minutes.")] });
+    }
+
+    try {
+      await message.author.send(
+        "📨 **Auto-Message Setup — Step 1/5**\n\n" +
+        "Please send your **account token** (the user token that will post the messages).\n\n" +
+        "⚠️ *Your token is used only for sending messages and is never stored persistently.*"
+      );
+      pendingSetups.set(member.id, { type: "automsg", step: 0, data: {} });
+      message.reply({ embeds: [okEmbed("📬 Setup started — check your DMs!")] });
+    } catch {
+      message.reply({ embeds: [errEmbed("I couldn't DM you. Please enable DMs from server members and try again.")] });
+    }
+    return;
+  }
+
+  // .joinvc — starts a DM-based VC join session (role-gated same as automsg)
+  if (command === "joinvc") {
+    if (!isAdmin(member) && getUserAutoMsgLimit(member) === null) {
+      return message.reply({ embeds: [errEmbed("You don't have permission to use `.joinvc`.")] });
+    }
+
+    if (pendingSetups.has(member.id)) {
+      return message.reply({ embeds: [errEmbed("You already have a setup in progress. Check your DMs.")] });
+    }
+
+    try {
+      await message.author.send(
+        "🎙️ **JoinVC Setup — Step 1/3**\n\n" +
+        "Please send your **account token** (the user account that will join the voice channel).\n\n" +
+        "⚠️ *Token is used only to join VC and is never stored persistently.*"
+      );
+      pendingSetups.set(member.id, { type: "joinvc", step: 0, data: {} });
+      message.reply({ embeds: [okEmbed("📬 Setup started — check your DMs!")] });
+    } catch {
+      message.reply({ embeds: [errEmbed("I couldn't DM you. Enable DMs from server members and try again.")] });
+    }
+    return;
+  }
+
+  // .stopmsg <session_id> — stop an active automsg or joinvc session
+  if (command === "stopmsg") {
+    const sessId = args[0]?.toUpperCase();
+    if (!sessId) return message.reply({ embeds: [errEmbed("Usage: `.stopmsg <session_id>`")] });
+
+    const sess = activeSessions.get(sessId);
+    if (!sess) return message.reply({ embeds: [errEmbed(`No active session found with ID \`${sessId}\`.`)] });
+
+    if (!isAdmin(member) && sess.userId !== member.id) {
+      return message.reply({ embeds: [errEmbed("You can only stop your own sessions.")] });
+    }
+
+    if (sess.type === "vc") {
+      try { sess.ws.close(); } catch {}
+      if (sess.hbTimer) clearInterval(sess.hbTimer);
+    } else {
+      clearInterval(sess.interval);
+    }
+    activeSessions.delete(sessId);
+
+    message.reply({ embeds: [okEmbed(`Session \`${sessId}\` stopped.`)] });
+    return;
+  }
+
+  // .sessions — list all active sessions (admin) or your own sessions (others)
+  if (command === "sessions") {
+    const entries = [...activeSessions.entries()];
+    const visible = isAdmin(member)
+      ? entries
+      : entries.filter(([, s]) => s.userId === member.id);
+
+    if (visible.length === 0) {
+      return message.reply({ embeds: [new EmbedBuilder().setTitle("📋  Active Sessions").setDescription("No active sessions.").setColor(Colors.Blurple)] });
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle(`📋  Active Sessions (${visible.length})`)
+      .setColor(Colors.Blurple);
+
+    for (const [id, s] of visible) {
+      const owner = await client.users.fetch(s.userId).catch(() => null);
+      embed.addFields({
+        name: `\`${id}\`  [${s.type === "vc" ? "🎙️ VC" : "📨 MSG"}]`,
+        value: `${s.desc}\nOwner: ${owner ? `<@${s.userId}>` : s.userId}`,
+        inline: false,
+      });
+    }
+    message.reply({ embeds: [embed] });
+    return;
+  }
+
   // .help [mod|info|util]
   if (command === "help") {
     const p   = PREFIX;
@@ -1815,6 +2506,33 @@ client.on("messageCreate", async (message) => {
           [`\`${p}help [mod|info|util]\``,             "Show this help menu"],
         ],
       },
+      follow: {
+        title: "📲  Follow Commands",
+        fields: [
+          [`\`${p}rfollow <username>\``,   "Order Roblox followers (100–500, live progress)"],
+          [`\`${p}ffollow <username>\``,   "Order Facebook followers (100–500, live progress)"],
+          [`\`${p}xfollow <gamertag>\``,   "Order Xbox followers (100–500, live progress)"],
+          [`\`${p}serverinvite\``,         "Show the server invite link embed"],
+          ["**Cooldown**",                 "Each platform has its own cooldown timer (default 24h)"],
+          ["**Role required**",            "Admin sets which role via `.setup follow_role @role`"],
+          ["**Setup**",                    "`.setup follow_role @role` · `.setup follow_cooldown <hrs>` · `.setup follow_log #ch`"],
+          ["**Embed images**",             "`.setup rfollow_image <url>` · `.setup ffollow_image <url>` · `.setup xfollow_image <url>`"],
+          ["**Invite reward**",            "`.setup invite_link <url>` · `.setup invite_role @role` · `.setup invite_channel #ch`"],
+        ],
+      },
+      automsg: {
+        title: "📨  Auto-Message & JoinVC Commands",
+        fields: [
+          [`\`${p}automsg\``,              "Start an auto-message session (bot DMs you for setup)"],
+          [`\`${p}joinvc\``,              "Join a voice channel via user token (bot DMs you for setup)"],
+          [`\`${p}stopmsg <id>\``,         "Stop an active auto-message or JoinVC session"],
+          [`\`${p}sessions\``,             "List your active sessions (admins see all)"],
+          ["**Mode 1**",                   "10 messages spread evenly over 10 minutes, then stops"],
+          ["**Mode 2**",                   "3 messages per minute, runs 24/7 until stopped"],
+          ["**Daily limits**",             "Admins set per-role limits with `.setup automsg_role @role <n>`"],
+          ["**Setup**",                    "`.setup automsg_role @role <daily_limit>`\n`.setup rm_automsg_role @role`\n`.setup automsg_roles` — list configured roles"],
+        ],
+      },
     };
 
     if (sec && sections[sec]) {
@@ -1827,10 +2545,12 @@ client.on("messageCreate", async (message) => {
     const embed = new EmbedBuilder()
       .setTitle("📖  Bot Help")
       .setDescription(
-        `\`${p}help mod\`  — Moderation commands\n` +
-        `\`${p}help info\` — Info & lookup commands\n` +
-        `\`${p}help util\` — Utility commands\n\n` +
-        "All admin commands require the Administrator permission or a configured admin role."
+        `\`${p}help mod\`     — Moderation commands\n` +
+        `\`${p}help info\`    — Info & lookup commands\n` +
+        `\`${p}help util\`    — Utility & fun commands\n` +
+        `\`${p}help follow\`  — Follow & invite reward commands\n` +
+        `\`${p}help automsg\` — Auto-message & JoinVC commands\n\n` +
+        "All admin commands require Administrator permission or a configured admin role."
       )
       .setColor(Colors.Blurple)
       .setFooter({ text: `Prefix: ${p}` });
